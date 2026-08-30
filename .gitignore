@@ -46,3 +46,13 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Secrets — TTLock clientId / clientSecret must never be committed
+.env
+.env.*
+lib/secrets.dart
+lib/**/secrets.dart
+**/*.secrets.dart
+
+# Internal handoff notes, not part of the shipped project
+TTLOCK_PROJECT_CONTEXT.md
