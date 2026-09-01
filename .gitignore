@@ -56,3 +56,9 @@ lib/**/secrets.dart
 
 # Internal handoff notes, not part of the shipped project
 TTLOCK_PROJECT_CONTEXT.md
+
+# Claude Code
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
