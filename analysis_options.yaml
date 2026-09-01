@@ -11,6 +11,10 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
+    # Vendored third-party plugin. Written against much older lint rules, so it
+    # produces hundreds of style infos that are not ours to fix and would bury
+    # real problems in our own code.
+    - packages/**
     - build/**
     - android/**
     - ios/**
