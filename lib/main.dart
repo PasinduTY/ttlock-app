@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:ttlock_flutter/ttlock.dart';
 
 import 'ble_permissions.dart';
+import 'lock_service.dart';
 
 void main() {
   runApp(const TTLockApp());
@@ -36,6 +38,10 @@ class _ScanPageState extends State<ScanPage> {
   final List<TTLockScanModel> _locks = [];
 
   bool _isScanning = false;
+
+  /// MAC of the lock currently being initialised, or null when idle.
+  /// Initialisation is a sustained BLE write, so only one may run at a time.
+  String? _initialisingMac;
 
   /// Explanation shown when we could not start scanning.
   String? _message;
@@ -145,8 +151,145 @@ class _ScanPageState extends State<ScanPage> {
     setState(() => _isScanning = false);
   }
 
+  Future<void> _onLockTapped(TTLockScanModel lock) async {
+    // Already-bound locks cannot be initialised, and only one write at a time.
+    if (lock.isInited || _initialisingMac != null) return;
+
+    final confirmed = await _confirmInitialise(lock);
+    if (!mounted || confirmed != true) return;
+
+    // Scanning while connecting makes the connection unreliable, so the radio
+    // is given over to the connection for the duration.
+    if (_isScanning) _stopScan();
+
+    setState(() {
+      _message = null;
+      _initialisingMac = lock.lockMac;
+    });
+
+    final result = await initialiseLock(lock);
+    if (!mounted) return;
+
+    setState(() => _initialisingMac = null);
+
+    switch (result) {
+      case InitLockSuccess(:final lockData):
+        // Logged as a backup in case the dialog is dismissed before the
+        // string is saved anywhere.
+        debugPrint('lockData for ${lock.lockMac}: $lockData');
+        setState(() => lock.isInited = true);
+        await _showLockDataDialog(lock, lockData);
+      case InitLockFailure(:final errorCode, :final message):
+        await _showFailureDialog(errorCode, message);
+    }
+  }
+
+  Future<bool?> _confirmInitialise(TTLockScanModel lock) {
+    return showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Initialise this lock?'),
+        content: Text(
+          '${lock.lockName}\n${lock.lockMac}\n\n'
+          'This writes new key material to the lock and binds it to this '
+          'phone. It cannot be undone without a physical factory reset.\n\n'
+          'Keep the lockData you get back — it is the only thing that can '
+          'control this lock afterwards.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Initialise'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showLockDataDialog(TTLockScanModel lock, String lockData) {
+    return showDialog<void>(
+      context: context,
+      // Dismissing by tapping outside would be an easy way to lose the only
+      // copy of lockData.
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        // The dialog owns this flag, so it needs its own state.
+        var copied = false;
+
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('Lock initialised'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('${lock.lockName} is now bound to this phone.'),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Save this lockData now. Without it the lock cannot be '
+                    'controlled and must be factory reset.',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  SelectableText(
+                    lockData,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: lockData));
+                  setDialogState(() => copied = true);
+                },
+                child: Text(copied ? 'Copied' : 'Copy'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Done'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showFailureDialog(TTLockError errorCode, String message) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Initialisation failed'),
+        content: Text(
+          '$message\n\n'
+          'Error: ${errorCode.name}\n\n'
+          'The lock may be left partly configured. Wake it and try again; if '
+          'it no longer appears in setting mode, factory reset it.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final isInitialising = _initialisingMac != null;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Locks'),
@@ -166,12 +309,14 @@ class _ScanPageState extends State<ScanPage> {
       ),
       body: Column(
         children: [
+          if (isInitialising) const LinearProgressIndicator(),
           if (_message != null) _buildMessage(),
           Expanded(child: _buildBody()),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _onScanPressed,
+        // Disabled mid-write: starting a scan would disturb the connection.
+        onPressed: isInitialising ? null : _onScanPressed,
         icon: Icon(_isScanning ? Icons.stop : Icons.bluetooth_searching),
         label: Text(_isScanning ? 'Stop' : 'Scan'),
       ),
@@ -221,7 +366,10 @@ class _ScanPageState extends State<ScanPage> {
       separatorBuilder: (context, index) => const Divider(height: 1),
       itemBuilder: (context, index) {
         final lock = _locks[index];
+        final isThisLockInitialising = _initialisingMac == lock.lockMac;
+
         return ListTile(
+          enabled: !lock.isInited && _initialisingMac == null,
           leading: Icon(
             lock.isInited ? Icons.lock : Icons.lock_open,
             color: lock.isInited ? Colors.grey : Colors.indigo,
@@ -229,10 +377,17 @@ class _ScanPageState extends State<ScanPage> {
           title: Text(lock.lockName),
           subtitle: Text(
             '${lock.lockMac}\n'
-            '${lock.isInited ? "Already initialised" : "In setting mode — ready to initialise"}',
+            '${lock.isInited ? "Already initialised" : "In setting mode — tap to initialise"}',
           ),
           isThreeLine: true,
-          trailing: Text('${lock.rssi} dBm'),
+          trailing: isThisLockInitialising
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Text('${lock.rssi} dBm'),
+          onTap: () => _onLockTapped(lock),
         );
       },
     );
