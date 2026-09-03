@@ -36,7 +36,12 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  permission_handler: 12.0.0
+  # Both are deliberately held back one major version. Their newer releases
+  # (permission_handler 13+, flutter_secure_storage 11+) require compileSdk 37,
+  # which AGP 9.1.0 does not officially support. Do not bump these without
+  # first raising compileSdk and AGP together.
+  permission_handler: ^12.0.0
+  flutter_secure_storage: ^9.2.4
 
 dev_dependencies:
   flutter_test:
