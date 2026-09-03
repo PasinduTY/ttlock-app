@@ -49,7 +49,7 @@ class _LockRow {
   bool get canInitialise => scan != null && !scan!.isInited;
 }
 
-enum _SavedLockAction { reset, forget }
+enum _SavedLockAction { unlock, reset, forget }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -78,7 +78,10 @@ class _ScanPageState extends State<ScanPage> {
   /// BLE connection and must not overlap with a scan.
   bool _isResetting = false;
 
-  bool get _isBusy => _initialisingMac != null || _isResetting;
+  /// True while an unlock is in flight. Also a held BLE connection.
+  bool _isUnlocking = false;
+
+  bool get _isBusy => _initialisingMac != null || _isResetting || _isUnlocking;
 
   /// Explanation shown when we could not start scanning.
   String? _message;
@@ -230,6 +233,70 @@ class _ScanPageState extends State<ScanPage> {
     });
 
     return rows;
+  }
+
+  Future<void> _unlock(SavedLock saved) async {
+    if (_isScanning) _stopScan();
+
+    setState(() {
+      _message = null;
+      _isUnlocking = true;
+    });
+
+    final result = await unlockLock(saved.lockData);
+    if (!mounted) return;
+
+    setState(() => _isUnlocking = false);
+
+    switch (result) {
+      case UnlockSuccess(
+        :final batteryPercent,
+        :final lockTime,
+        :final uniqueId,
+        :final updatedLockData,
+      ):
+        var credentialRefreshed = false;
+
+        if (updatedLockData != null) {
+          // Persist the refreshed credential before anything else. The lock
+          // has already moved on; our stored copy is what is now stale.
+          final refreshed = SavedLock(
+            lockMac: saved.lockMac,
+            lockName: saved.lockName,
+            lockData: updatedLockData,
+            lockVersion: saved.lockVersion,
+            savedAt: DateTime.now(),
+          );
+
+          try {
+            await _storage.save(refreshed);
+            credentialRefreshed = true;
+            if (!mounted) return;
+            setState(() => _savedLocks[refreshed.lockMac] = refreshed);
+          } catch (error) {
+            debugPrint('Unlocked but could not persist new lockData: $error');
+          }
+        }
+
+        if (!mounted) return;
+
+        await _showInfoDialog(
+          'Unlocked',
+          '${saved.lockName}\n\n'
+              'Battery: $batteryPercent%\n'
+              'Lock clock: ${DateTime.fromMillisecondsSinceEpoch(lockTime)}\n'
+              'Record id: $uniqueId'
+              '${credentialRefreshed ? "\n\nStored credential refreshed." : ""}',
+        );
+      case UnlockFailure(:final errorCode, :final message):
+        await _showInfoDialog(
+          'Unlock failed',
+          '$message\n\n'
+              'Error: ${errorCode.name}\n\n'
+              'Wake the lock by touching its keypad, keep the phone close, and '
+              'try again.',
+        );
+    }
   }
 
   /// Factory resets whichever lock [lockData] authorises, putting it back into
@@ -521,7 +588,8 @@ class _ScanPageState extends State<ScanPage> {
           '${saved.lockMac}\n\n'
           'Saved ${saved.savedAt.toLocal()}\n'
           '${row.isInRange ? "In range now." : "Not currently in range."}\n\n'
-          'Unlocking is not built yet.\n\n'
+          '${row.isInRange ? "" : "Unlock needs the lock in range — wake it "
+              "and scan again.\n\n"}'
           'Reset puts the lock back into setting mode over Bluetooth and '
           'deletes the stored lockData. Forget deletes only our copy, leaving '
           'the lock bound and unusable — reset instead unless you know why you '
@@ -540,10 +608,17 @@ class _ScanPageState extends State<ScanPage> {
                 Navigator.pop(dialogContext, _SavedLockAction.forget),
             child: const Text('Forget'),
           ),
-          FilledButton(
+          TextButton(
             onPressed: () =>
                 Navigator.pop(dialogContext, _SavedLockAction.reset),
             child: const Text('Reset'),
+          ),
+          FilledButton(
+            // Holding the credential is not enough; the lock has to be here.
+            onPressed: row.isInRange
+                ? () => Navigator.pop(dialogContext, _SavedLockAction.unlock)
+                : null,
+            child: const Text('Unlock'),
           ),
         ],
       ),
@@ -552,6 +627,8 @@ class _ScanPageState extends State<ScanPage> {
     if (!mounted || action == null) return;
 
     switch (action) {
+      case _SavedLockAction.unlock:
+        await _unlock(saved);
       case _SavedLockAction.reset:
         await _resetWithLockData(saved.lockData, knownMac: saved.lockMac);
       case _SavedLockAction.forget:
