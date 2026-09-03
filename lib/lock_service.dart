@@ -31,6 +31,72 @@ class InitLockFailure extends InitLockResult {
   final String message;
 }
 
+/// Outcome of asking a lock to open.
+sealed class UnlockResult {
+  const UnlockResult();
+}
+
+/// The lock opened.
+class UnlockSuccess extends UnlockResult {
+  const UnlockSuccess({
+    required this.lockTime,
+    required this.batteryPercent,
+    required this.uniqueId,
+    required this.updatedLockData,
+  });
+
+  /// The lock's own clock when it opened, in milliseconds since the epoch.
+  /// It can differ from the phone's clock — the lock has no internet.
+  final int lockTime;
+
+  /// Battery remaining, as a percentage.
+  final int batteryPercent;
+
+  /// Identifier of the operation record the lock stored for this unlock.
+  final int uniqueId;
+
+  /// A refreshed credential, or null when the SDK returned nothing new.
+  ///
+  /// Opening a lock can advance its internal state, and the SDK hands back
+  /// updated `lockData` reflecting that. **Persist it.** Keeping the old
+  /// string can leave the app out of sync with the lock.
+  final String? updatedLockData;
+}
+
+class UnlockFailure extends UnlockResult {
+  const UnlockFailure(this.errorCode, this.message);
+
+  final TTLockError errorCode;
+  final String message;
+}
+
+/// Opens the lock that [lockData] authorises, over BLE.
+///
+/// The lock must be awake and in range. No scan is needed first — [lockData]
+/// carries everything required to find and authenticate to it.
+Future<UnlockResult> unlockLock(String lockData) {
+  final completer = Completer<UnlockResult>();
+
+  TTLock.controlLock(
+    lockData,
+    TTControlAction.unlock,
+    (lockTime, electricQuantity, uniqueId, newLockData) => completer.complete(
+      UnlockSuccess(
+        lockTime: lockTime,
+        batteryPercent: electricQuantity,
+        uniqueId: uniqueId,
+        // The SDK sends an empty string when nothing changed; normalise that
+        // to null so callers cannot accidentally store a blank credential.
+        updatedLockData: newLockData.isEmpty ? null : newLockData,
+      ),
+    ),
+    (errorCode, errorMsg) =>
+        completer.complete(UnlockFailure(errorCode, errorMsg)),
+  );
+
+  return completer.future;
+}
+
 /// Outcome of resetting a lock back to setting mode.
 sealed class ResetLockResult {
   const ResetLockResult();
