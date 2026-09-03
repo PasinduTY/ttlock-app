@@ -31,6 +31,47 @@ class InitLockFailure extends InitLockResult {
   final String message;
 }
 
+/// Outcome of resetting a lock back to setting mode.
+sealed class ResetLockResult {
+  const ResetLockResult();
+}
+
+/// The lock is unbound and advertising in setting mode again. The `lockData`
+/// used to reset it is now dead and should be deleted.
+class ResetLockSuccess extends ResetLockResult {
+  const ResetLockSuccess();
+}
+
+class ResetLockFailure extends ResetLockResult {
+  const ResetLockFailure(this.errorCode, this.message);
+
+  final TTLockError errorCode;
+  final String message;
+}
+
+/// Factory resets the lock that [lockData] authorises, over BLE.
+///
+/// The lock does not need to be scanned first: everything needed to find and
+/// authenticate to it is encoded in [lockData]. It does need to be awake and
+/// in range, so touch its keypad before calling.
+///
+/// This is the software equivalent of holding the reset button inside the
+/// battery compartment. It only works while [lockData] is still valid — once
+/// a lock is reset or re-initialised elsewhere, only the physical button will
+/// bring it back.
+Future<ResetLockResult> resetLock(String lockData) {
+  final completer = Completer<ResetLockResult>();
+
+  TTLock.resetLock(
+    lockData,
+    () => completer.complete(const ResetLockSuccess()),
+    (errorCode, errorMsg) =>
+        completer.complete(ResetLockFailure(errorCode, errorMsg)),
+  );
+
+  return completer.future;
+}
+
 /// Binds [scanModel]'s lock to this phone and returns its `lockData`.
 ///
 /// The lock must be in setting mode: check `scanModel.isInited == false`
