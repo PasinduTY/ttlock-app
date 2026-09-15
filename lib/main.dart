@@ -49,7 +49,7 @@ class _LockRow {
   bool get canInitialise => scan != null && !scan!.isInited;
 }
 
-enum _SavedLockAction { unlock, reset, forget }
+enum _SavedLockAction { unlock, copy, reset, forget }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -255,10 +255,19 @@ class _ScanPageState extends State<ScanPage> {
         :final uniqueId,
         :final updatedLockData,
       ):
-        var credentialRefreshed = false;
+        // Non-empty is not the same as new: the SDK may hand back the very
+        // string we sent. Only a different string is a rotation.
+        final changed =
+            updatedLockData != null && updatedLockData != saved.lockData;
+        var storedCopyUpdated = false;
 
-        if (updatedLockData != null) {
-          // Persist the refreshed credential before anything else. The lock
+        debugPrint(
+          'Unlock ${saved.lockMac}: returned lockData '
+          '${updatedLockData == null ? "empty" : changed ? "DIFFERENT" : "IDENTICAL"}',
+        );
+
+        if (changed) {
+          // Persist the rotated credential before anything else. The lock
           // has already moved on; our stored copy is what is now stale.
           final refreshed = SavedLock(
             lockMac: saved.lockMac,
@@ -270,7 +279,7 @@ class _ScanPageState extends State<ScanPage> {
 
           try {
             await _storage.save(refreshed);
-            credentialRefreshed = true;
+            storedCopyUpdated = true;
             if (!mounted) return;
             setState(() => _savedLocks[refreshed.lockMac] = refreshed);
           } catch (error) {
@@ -285,8 +294,9 @@ class _ScanPageState extends State<ScanPage> {
           '${saved.lockName}\n\n'
               'Battery: $batteryPercent%\n'
               'Lock clock: ${DateTime.fromMillisecondsSinceEpoch(lockTime)}\n'
-              'Record id: $uniqueId'
-              '${credentialRefreshed ? "\n\nStored credential refreshed." : ""}',
+              'Record id: $uniqueId\n\n'
+              '${_describeReturnedLockData(updatedLockData, saved.lockData)}'
+              '${changed && !storedCopyUpdated ? "\nSaving the new copy FAILED." : ""}',
         );
       case UnlockFailure(:final errorCode, :final message):
         await _showInfoDialog(
@@ -351,24 +361,107 @@ class _ScanPageState extends State<ScanPage> {
     }
   }
 
+  /// Explains what the SDK handed back after an unlock, relative to the
+  /// lockData that was sent.
+  String _describeReturnedLockData(String? returned, String sent) {
+    if (returned == null) return 'The SDK returned no lockData.';
+    if (returned == sent) {
+      return 'The SDK returned the SAME lockData that was sent — no rotation.';
+    }
+    return 'The SDK returned a DIFFERENT lockData — it rotated.';
+  }
+
   /// Reset using a lockData string pasted by hand — the escape hatch for a
   /// lock that was initialised before this app stored anything.
   Future<void> _showResetByPasteDialog() async {
+    final lockData = await _promptForLockData(
+      title: 'Reset with lockData',
+      instructions:
+          'Paste the lockData for the lock you want to reset. Wake the lock '
+          'first and keep the phone close to it.',
+      actionLabel: 'Reset',
+    );
+    if (!mounted || lockData == null) return;
+    await _resetWithLockData(lockData);
+  }
+
+  /// Unlock using a pasted lockData, without touching storage.
+  ///
+  /// Exists to answer one question: does the lock still accept a lockData
+  /// string after it has rotated? If it does, several phones could share one
+  /// credential; if not, they cannot.
+  Future<void> _unlockByPasteDialog() async {
+    final pasted = await _promptForLockData(
+      title: 'Unlock with lockData',
+      instructions:
+          'Test tool. Paste any lockData — for example an older copy saved '
+          'before a previous unlock. Nothing is saved, whatever happens.',
+      actionLabel: 'Unlock',
+    );
+    if (!mounted || pasted == null) return;
+
+    if (_isScanning) _stopScan();
+    setState(() {
+      _message = null;
+      _isUnlocking = true;
+    });
+
+    final result = await unlockLock(pasted);
+    if (!mounted) return;
+    setState(() => _isUnlocking = false);
+
+    // Tell the tester which stored record, if any, this string matches.
+    final matching = _savedLocks.values
+        .where((lock) => lock.lockData == pasted)
+        .map((lock) => lock.lockName);
+    final relation = matching.isEmpty
+        ? 'It does NOT match the lockData currently stored for any lock.'
+        : 'It matches the stored lockData for: ${matching.join(", ")}.';
+
+    switch (result) {
+      case UnlockSuccess(:final batteryPercent, :final updatedLockData):
+        debugPrint(
+          'Paste-unlock succeeded. Stored match: ${matching.isNotEmpty}',
+        );
+        await _showInfoDialog(
+          'Unlocked with pasted lockData',
+          '$relation\n\n'
+              'Battery: $batteryPercent%\n\n'
+              '${_describeReturnedLockData(updatedLockData, pasted)}\n\n'
+              'Storage was not changed.',
+        );
+      case UnlockFailure(:final errorCode, :final message):
+        debugPrint('Paste-unlock failed: ${errorCode.name}');
+        await _showInfoDialog(
+          'Pasted lockData was rejected',
+          '$relation\n\n'
+              '$message\n'
+              'Error: ${errorCode.name}\n\n'
+              'If the lock was awake and close, this is the answer: it does '
+              'not accept this lockData. If it may have been asleep, wake it '
+              'and try once more before concluding.',
+        );
+    }
+  }
+
+  /// Asks for a lockData string. Returns null if cancelled.
+  Future<String?> _promptForLockData({
+    required String title,
+    required String instructions,
+    required String actionLabel,
+  }) async {
     final controller = TextEditingController();
 
     try {
-      final lockData = await showDialog<String>(
+      return await showDialog<String>(
         context: context,
         builder: (dialogContext) => AlertDialog(
-          title: const Text('Reset with lockData'),
+          title: Text(title),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Paste the lockData for the lock you want to reset. Wake the '
-                'lock first and keep the phone close to it.',
-              ),
+              Text(instructions),
               const SizedBox(height: 16),
               TextField(
                 controller: controller,
@@ -394,14 +487,11 @@ class _ScanPageState extends State<ScanPage> {
                 if (text.isEmpty) return;
                 Navigator.pop(dialogContext, text);
               },
-              child: const Text('Reset'),
+              child: Text(actionLabel),
             ),
           ],
         ),
       );
-
-      if (!mounted || lockData == null) return;
-      await _resetWithLockData(lockData);
     } finally {
       controller.dispose();
     }
@@ -610,6 +700,11 @@ class _ScanPageState extends State<ScanPage> {
           ),
           TextButton(
             onPressed: () =>
+                Navigator.pop(dialogContext, _SavedLockAction.copy),
+            child: const Text('Copy lockData'),
+          ),
+          TextButton(
+            onPressed: () =>
                 Navigator.pop(dialogContext, _SavedLockAction.reset),
             child: const Text('Reset'),
           ),
@@ -629,6 +724,12 @@ class _ScanPageState extends State<ScanPage> {
     switch (action) {
       case _SavedLockAction.unlock:
         await _unlock(saved);
+      case _SavedLockAction.copy:
+        await Clipboard.setData(ClipboardData(text: saved.lockData));
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('lockData copied to clipboard')),
+        );
       case _SavedLockAction.reset:
         await _resetWithLockData(saved.lockData, knownMac: saved.lockMac);
       case _SavedLockAction.forget:
@@ -681,6 +782,10 @@ class _ScanPageState extends State<ScanPage> {
           PopupMenuButton<void>(
             enabled: !_isBusy,
             itemBuilder: (context) => [
+              PopupMenuItem<void>(
+                onTap: _unlockByPasteDialog,
+                child: const Text('Unlock with lockData… (test)'),
+              ),
               PopupMenuItem<void>(
                 onTap: _showResetByPasteDialog,
                 child: const Text('Reset with lockData…'),
