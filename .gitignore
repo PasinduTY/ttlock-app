@@ -31,6 +31,10 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+# The leading-slash rule above only matches the root build folder. Gradle
+# also writes android/build/ (e.g. reports/problems/problems-report.html)
+# when run from the android directory, so ignore build folders at any depth.
+**/build/
 /coverage/
 
 # Symbolication related
