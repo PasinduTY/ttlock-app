@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:ttlock_flutter/ttlock.dart';
 
+import 'backend_client.dart';
 import 'ble_permissions.dart';
 import 'lock_service.dart';
 import 'lock_storage.dart';
@@ -61,6 +62,8 @@ class ScanPage extends StatefulWidget {
 class _ScanPageState extends State<ScanPage> {
   final LockStorage _storage = LockStorage();
 
+  final BackendClient _backend = BackendClient();
+
   /// Locks we have initialised, keyed by MAC. Survives restarts.
   final Map<String, SavedLock> _savedLocks = {};
 
@@ -104,6 +107,7 @@ class _ScanPageState extends State<ScanPage> {
     // screen is gone. Not stopping it drains the battery and eventually gets
     // the app throttled by Android for scanning too aggressively.
     TTLock.stopScanLock();
+    _backend.close();
     super.dispose();
   }
 
@@ -357,6 +361,33 @@ class _ScanPageState extends State<ScanPage> {
               'Wake the lock by touching its keypad, keep the phone close, and '
               'try again. If the lockData is no longer valid, only the physical '
               'reset button will work.',
+        );
+    }
+  }
+
+  Future<void> _checkBackend() async {
+    final result = await _backend.checkHealth();
+    if (!mounted) return;
+
+    switch (result) {
+      case HealthOk(:final serverTime):
+        await _showInfoDialog(
+          'Backend reachable',
+          '${_backend.baseUrl}\n\nServer time: ${serverTime.toLocal()}',
+        );
+      case HealthUnreachable(:final reason):
+        await _showInfoDialog(
+          'Backend unreachable',
+          '${_backend.baseUrl}\n\n$reason\n\n'
+              'Is the server running? Is the USB cable connected, and has '
+              '"adb reverse tcp:5007 tcp:5007" been run since it was plugged '
+              'in?',
+        );
+      case HealthBadResponse(:final reason):
+        await _showInfoDialog(
+          'Unexpected reply',
+          '${_backend.baseUrl}\n\n$reason\n\n'
+              'Something answered, but it does not look like our backend.',
         );
     }
   }
@@ -782,6 +813,10 @@ class _ScanPageState extends State<ScanPage> {
           PopupMenuButton<void>(
             enabled: !_isBusy,
             itemBuilder: (context) => [
+              PopupMenuItem<void>(
+                onTap: _checkBackend,
+                child: const Text('Check backend'),
+              ),
               PopupMenuItem<void>(
                 onTap: _unlockByPasteDialog,
                 child: const Text('Unlock with lockData… (test)'),
