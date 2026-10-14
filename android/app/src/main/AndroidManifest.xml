@@ -10,6 +10,12 @@
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- To reach our backend. Flutter adds this to debug and profile builds
+         automatically but not to release ones, so without this line the app
+         works during development and silently loses all network access when
+         released. Install-time only: it never shows a prompt. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:label="ttlock_app"
         android:name="${applicationName}"

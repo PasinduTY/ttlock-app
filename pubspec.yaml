@@ -42,6 +42,7 @@ dependencies:
   # first raising compileSdk and AGP together.
   permission_handler: ^12.0.0
   flutter_secure_storage: ^9.2.4
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:
