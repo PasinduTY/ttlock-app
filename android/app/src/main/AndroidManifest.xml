@@ -16,10 +16,17 @@
          released. Install-time only: it never shows a prompt. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- allowBackup="false": Android's default is to back app data up to
+         Google Drive and restore it on reinstall. Our lockData is encrypted
+         with an Android Keystore key, which is never backed up, so a restored
+         copy cannot be decrypted (flutter_secure_storage fails with "Failed to
+         unwrap key"). It would also put credentials somewhere we don't
+         control. Our own backend is the backup for locks instead. -->
     <application
         android:label="ttlock_app"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

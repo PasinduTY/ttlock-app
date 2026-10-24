@@ -8,6 +8,7 @@ import 'backend_client.dart';
 import 'ble_permissions.dart';
 import 'lock_service.dart';
 import 'lock_storage.dart';
+import 'lock_sync.dart';
 
 void main() {
   runApp(const TTLockApp());
@@ -50,7 +51,7 @@ class _LockRow {
   bool get canInitialise => scan != null && !scan!.isInited;
 }
 
-enum _SavedLockAction { unlock, copy, reset, forget }
+enum _SavedLockAction { unlock, copy, reset }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -63,6 +64,13 @@ class _ScanPageState extends State<ScanPage> {
   final LockStorage _storage = LockStorage();
 
   final BackendClient _backend = BackendClient();
+
+  /// `late` because it needs the two fields above, which don't exist yet when
+  /// field initialisers run. It is created on first use, by which time they do.
+  late final LockSync _sync = LockSync(storage: _storage, backend: _backend);
+
+  /// True while a sync is running. Shown as a spinner; never blocks anything.
+  bool _isSyncing = false;
 
   /// Locks we have initialised, keyed by MAC. Survives restarts.
   final Map<String, SavedLock> _savedLocks = {};
@@ -98,7 +106,14 @@ class _ScanPageState extends State<ScanPage> {
     // Makes the native SDK log its BLE traffic to logcat. Invaluable while
     // bringing this up; turn it off before release.
     TTLock.printLog = true;
-    _loadSavedLocks();
+    _startUp();
+  }
+
+  /// Show what this phone already has straight away, then sync. The list is
+  /// usable even if the backend never answers.
+  Future<void> _startUp() async {
+    await _loadSavedLocks();
+    await _syncNow();
   }
 
   @override
@@ -111,7 +126,10 @@ class _ScanPageState extends State<ScanPage> {
     super.dispose();
   }
 
-  /// [initState] cannot be async, so the read is kicked off and lands later.
+  /// Re-reads saved locks from storage into the list on screen.
+  ///
+  /// Replaces the whole map rather than adding to it, so locks a sync pulled
+  /// in appear and locks a reset removed disappear.
   Future<void> _loadSavedLocks() async {
     List<SavedLock> locks;
     try {
@@ -126,10 +144,67 @@ class _ScanPageState extends State<ScanPage> {
     if (!mounted) return;
 
     setState(() {
-      for (final lock in locks) {
-        _savedLocks[lock.lockMac] = lock;
-      }
+      _savedLocks
+        ..clear()
+        ..addAll({for (final lock in locks) lock.lockMac: lock});
     });
+  }
+
+  /// Syncs with the backend, then refreshes the list.
+  ///
+  /// Never throws and never blocks: an unreachable backend just means the
+  /// next sync tries again, and rows show "not backed up" until then.
+  /// With [showReport], the outcome is shown in a dialog (for "Sync now").
+  Future<void> _syncNow({bool showReport = false}) async {
+    if (!mounted) return;
+    setState(() => _isSyncing = true);
+
+    SyncReport report;
+    try {
+      report = await _sync.run();
+    } catch (error) {
+      // Storage failures, not network ones: those come back in the report.
+      debugPrint('Sync failed: $error');
+      report = SyncReport(problems: ['$error']);
+    }
+    if (!mounted) return;
+
+    setState(() => _isSyncing = false);
+    await _loadSavedLocks();
+    if (!mounted) return;
+
+    debugPrint(
+      'Sync: ${report.uploaded} up, ${report.pulled} pulled, '
+      '${report.refreshed} refreshed, ${report.deleted} deleted, '
+      '${report.problems.length} problems, '
+      'reached backend: ${report.reachedBackend}',
+    );
+
+    if (showReport) {
+      await _showInfoDialog(
+        report.reachedBackend ? 'Sync complete' : 'Backend unreachable',
+        _describeSync(report),
+      );
+    }
+  }
+
+  String _describeSync(SyncReport report) {
+    final lines = [
+      if (!report.reachedBackend)
+        'Stopped early: ${report.unreachableReason}\n'
+            'Nothing was lost. Locks stay marked "not backed up" and the next '
+            'sync retries.\n',
+      'Uploaded: ${report.uploaded}',
+      'Pulled from backend: ${report.pulled}',
+      'Refreshed from backend: ${report.refreshed}',
+      'Pending deletes completed: ${report.deleted}',
+      if (report.problems.isNotEmpty) ...[
+        '',
+        'Refused by the backend:',
+        ...report.problems,
+      ],
+    ];
+    return lines.join('\n');
   }
 
   /// The SDK reports Bluetooth state through a callback. [Completer] adapts
@@ -267,7 +342,11 @@ class _ScanPageState extends State<ScanPage> {
 
         debugPrint(
           'Unlock ${saved.lockMac}: returned lockData '
-          '${updatedLockData == null ? "empty" : changed ? "DIFFERENT" : "IDENTICAL"}',
+          '${updatedLockData == null
+              ? "empty"
+              : changed
+              ? "DIFFERENT"
+              : "IDENTICAL"}',
         );
 
         if (changed) {
@@ -286,6 +365,9 @@ class _ScanPageState extends State<ScanPage> {
             storedCopyUpdated = true;
             if (!mounted) return;
             setState(() => _savedLocks[refreshed.lockMac] = refreshed);
+            // The backend now holds the old lockData. The refreshed record is
+            // saved as not backed up, so this sync uploads it.
+            unawaited(_syncNow());
           } catch (error) {
             debugPrint('Unlocked but could not persist new lockData: $error');
           }
@@ -314,8 +396,8 @@ class _ScanPageState extends State<ScanPage> {
   }
 
   /// Factory resets whichever lock [lockData] authorises, putting it back into
-  /// setting mode. [knownMac] is the saved record to drop afterwards, if the
-  /// reset came from one; the paste path has no record to clean up.
+  /// setting mode. [knownMac] is the saved record to drop afterwards, if we
+  /// know which one it is.
   Future<void> _resetWithLockData(String lockData, {String? knownMac}) async {
     if (_isScanning) _stopScan();
 
@@ -331,14 +413,18 @@ class _ScanPageState extends State<ScanPage> {
 
     switch (result) {
       case ResetLockSuccess():
-        // The lockData just used is now dead. Keeping the record would leave
-        // a saved lock that no longer answers to it.
+        // The lockData just used is now dead, here and on the backend.
         if (knownMac != null) {
           try {
+            // Tombstone FIRST, then delete. If the app died between the two,
+            // the tombstone still gets the backend copy removed. The other
+            // order could leave a dead record on the backend that the next
+            // sync pulls straight back onto this phone.
+            await _storage.addTombstone(knownMac);
             await _storage.delete(knownMac);
           } catch (error) {
             debugPrint(
-              'Reset succeeded but deleting the record failed: $error',
+              'Reset succeeded but updating local storage failed: $error',
             );
           }
           if (!mounted) return;
@@ -346,12 +432,16 @@ class _ScanPageState extends State<ScanPage> {
             _savedLocks.remove(knownMac);
             _scanned.remove(knownMac);
           });
+          unawaited(_syncNow());
         }
 
         await _showInfoDialog(
           'Lock reset',
           'The lock is back in setting mode. Scan and tap it to initialise it '
-              'again.',
+              'again.'
+              '${knownMac == null ? "\n\nThis lockData did not match any saved "
+                        "lock, so the backend was not told. If it holds this "
+                        "lock, its copy is now dead." : ""}',
         );
       case ResetLockFailure(:final errorCode, :final message):
         await _showInfoDialog(
@@ -413,7 +503,14 @@ class _ScanPageState extends State<ScanPage> {
       actionLabel: 'Reset',
     );
     if (!mounted || lockData == null) return;
-    await _resetWithLockData(lockData);
+
+    // If this is a lock we hold, tell the reset which one, so it removes our
+    // record and the backend's too.
+    final match = _savedLocks.values
+        .where((lock) => lock.lockData == lockData)
+        .map((lock) => lock.lockMac)
+        .firstOrNull;
+    await _resetWithLockData(lockData, knownMac: match);
   }
 
   /// Unlock using a pasted lockData, without touching storage.
@@ -605,6 +702,11 @@ class _ScanPageState extends State<ScanPage> {
           lock.isInited = true;
         });
 
+        // Back it up straight away. Not awaited: the dialog shouldn't wait
+        // for the network, and if the upload fails the lock just stays
+        // "not backed up" until the next sync.
+        if (!saveFailed) unawaited(_syncNow());
+
         await _showLockDataDialog(saved, saveFailed: saveFailed);
       case InitLockFailure(:final errorCode, :final message):
         await _showFailureDialog(errorCode, message);
@@ -709,25 +811,18 @@ class _ScanPageState extends State<ScanPage> {
           '${saved.lockMac}\n\n'
           'Saved ${saved.savedAt.toLocal()}\n'
           '${row.isInRange ? "In range now." : "Not currently in range."}\n\n'
+          '${saved.backedUp ? "Backed up to the server." : "NOT backed up "
+                    "yet — this phone holds the only copy. Sync retries "
+                    "automatically."}\n\n'
           '${row.isInRange ? "" : "Unlock needs the lock in range — wake it "
-              "and scan again.\n\n"}'
+                    "and scan again.\n\n"}'
           'Reset puts the lock back into setting mode over Bluetooth and '
-          'deletes the stored lockData. Forget deletes only our copy, leaving '
-          'the lock bound and unusable — reset instead unless you know why you '
-          'want that.',
+          'removes it from this phone and the server.',
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Close'),
-          ),
-          TextButton(
-            style: TextButton.styleFrom(
-              foregroundColor: Theme.of(context).colorScheme.error,
-            ),
-            onPressed: () =>
-                Navigator.pop(dialogContext, _SavedLockAction.forget),
-            child: const Text('Forget'),
           ),
           TextButton(
             onPressed: () =>
@@ -763,10 +858,6 @@ class _ScanPageState extends State<ScanPage> {
         );
       case _SavedLockAction.reset:
         await _resetWithLockData(saved.lockData, knownMac: saved.lockMac);
-      case _SavedLockAction.forget:
-        await _storage.delete(saved.lockMac);
-        if (!mounted) return;
-        setState(() => _savedLocks.remove(saved.lockMac));
     }
   }
 
@@ -799,6 +890,14 @@ class _ScanPageState extends State<ScanPage> {
       appBar: AppBar(
         title: const Text('Locks'),
         actions: [
+          if (_isSyncing)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: Tooltip(
+                message: 'Syncing with the server',
+                child: Icon(Icons.cloud_sync_outlined),
+              ),
+            ),
           if (_isScanning)
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16),
@@ -813,6 +912,10 @@ class _ScanPageState extends State<ScanPage> {
           PopupMenuButton<void>(
             enabled: !_isBusy,
             itemBuilder: (context) => [
+              PopupMenuItem<void>(
+                onTap: () => _syncNow(showReport: true),
+                child: const Text('Sync now'),
+              ),
               PopupMenuItem<void>(
                 onTap: _checkBackend,
                 child: const Text('Check backend'),
@@ -899,9 +1002,15 @@ class _ScanPageState extends State<ScanPage> {
     final Color? iconColour;
 
     if (row.isSaved) {
-      status = row.isInRange ? 'Saved · in range' : 'Saved · not nearby';
+      final where = row.isInRange ? 'in range' : 'not nearby';
+      // Worth seeing at a glance: until it's backed up, losing this phone
+      // means losing this lock.
+      final backup = row.saved!.backedUp ? '' : ' · NOT BACKED UP';
+      status = 'Saved · $where$backup';
       icon = Icons.lock;
-      iconColour = theme.colorScheme.primary;
+      iconColour = row.saved!.backedUp
+          ? theme.colorScheme.primary
+          : theme.colorScheme.error;
     } else if (row.canInitialise) {
       status = 'In setting mode — tap to initialise';
       icon = Icons.lock_open;
