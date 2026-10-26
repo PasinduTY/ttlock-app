@@ -9,6 +9,8 @@ import 'ble_permissions.dart';
 import 'lock_service.dart';
 import 'lock_storage.dart';
 import 'lock_sync.dart';
+import 'login_page.dart';
+import 'session_store.dart';
 
 void main() {
   runApp(const TTLockApp());
@@ -72,6 +74,15 @@ class _ScanPageState extends State<ScanPage> {
   /// True while a sync is running. Shown as a spinner; never blocks anything.
   bool _isSyncing = false;
 
+  final SessionStore _sessions = SessionStore();
+
+  /// Who is signed in, or null. Only syncing needs this; unlocking never does.
+  Session? _session;
+
+  /// Guards against opening two login screens at once, e.g. the start-up
+  /// prompt and a 401 from a sync arriving together.
+  bool _loginOpen = false;
+
   /// Locks we have initialised, keyed by MAC. Survives restarts.
   final Map<String, SavedLock> _savedLocks = {};
 
@@ -109,11 +120,84 @@ class _ScanPageState extends State<ScanPage> {
     _startUp();
   }
 
-  /// Show what this phone already has straight away, then sync. The list is
-  /// usable even if the backend never answers.
+  /// Show what this phone already has straight away, then either sync (if
+  /// signed in) or offer the login screen. The list is usable either way.
   Future<void> _startUp() async {
     await _loadSavedLocks();
-    await _syncNow();
+
+    Session? saved;
+    try {
+      saved = await _sessions.load();
+    } catch (error) {
+      debugPrint('Could not read the saved session: $error');
+    }
+    if (!mounted) return;
+
+    if (saved != null && !saved.isExpired) {
+      _backend.token = saved.token;
+      setState(() => _session = saved);
+      await _syncNow();
+      return;
+    }
+
+    if (saved != null) {
+      // Expired: no point keeping it, and no point sending it.
+      await _forgetSession();
+    }
+    await _openLogin(
+      reason: saved == null
+          ? null
+          : 'Your sign-in expired. Sign in again to keep locks backed up.',
+    );
+  }
+
+  /// Shows the login screen on top of the lock list. Backing out of it is
+  /// allowed: the locks on this phone keep working, just without backup.
+  Future<void> _openLogin({String? reason}) async {
+    if (_loginOpen || !mounted) return;
+    _loginOpen = true;
+
+    // Navigating while a frame is being built is an error, and this can be
+    // reached from initState's follow-up work. Wait for the frame to finish.
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) {
+      _loginOpen = false;
+      return;
+    }
+
+    final session = await Navigator.of(context).push<Session>(
+      MaterialPageRoute(
+        builder: (_) =>
+            LoginPage(backend: _backend, sessions: _sessions, reason: reason),
+      ),
+    );
+    _loginOpen = false;
+    if (!mounted || session == null) return;
+
+    setState(() => _session = session);
+    // Anything initialised while signed out goes up now.
+    unawaited(_syncNow());
+  }
+
+  /// Clears the login on this phone. Never touches the locks.
+  Future<void> _forgetSession() async {
+    try {
+      await _sessions.clear();
+    } catch (error) {
+      debugPrint('Could not clear the saved session: $error');
+    }
+    _backend.token = null;
+    if (mounted) setState(() => _session = null);
+  }
+
+  Future<void> _signOut() async {
+    await _forgetSession();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Signed out. Locks on this phone still unlock.'),
+      ),
+    );
   }
 
   @override
@@ -157,6 +241,18 @@ class _ScanPageState extends State<ScanPage> {
   /// With [showReport], the outcome is shown in a dialog (for "Sync now").
   Future<void> _syncNow({bool showReport = false}) async {
     if (!mounted) return;
+
+    if (_session == null) {
+      // Every request would just be refused. Say so if the user asked.
+      if (showReport) {
+        await _showInfoDialog(
+          'Not signed in',
+          'Sign in to back up locks and receive locks from other admins.',
+        );
+      }
+      return;
+    }
+
     setState(() => _isSyncing = true);
 
     SyncReport report;
@@ -177,8 +273,21 @@ class _ScanPageState extends State<ScanPage> {
       'Sync: ${report.uploaded} up, ${report.pulled} pulled, '
       '${report.refreshed} refreshed, ${report.deleted} deleted, '
       '${report.problems.length} problems, '
-      'reached backend: ${report.reachedBackend}',
+      'reached backend: ${report.reachedBackend}, '
+      'needs login: ${report.needsLogin}',
     );
+
+    if (report.needsLogin) {
+      // Expired, or the account was removed. Nothing was lost; the sync
+      // picks up where it stopped once someone signs in again.
+      await _forgetSession();
+      await _openLogin(
+        reason:
+            'The server no longer accepts your sign-in: it expired, or the '
+            'account was removed. Sign in again to keep locks backed up.',
+      );
+      return;
+    }
 
     if (showReport) {
       await _showInfoDialog(
@@ -721,7 +830,10 @@ class _ScanPageState extends State<ScanPage> {
         content: Text(
           '${lock.lockName}\n${lock.lockMac}\n\n'
           'This writes new key material to the lock and binds it to this '
-          'phone. It cannot be undone without a physical factory reset.',
+          'phone. It cannot be undone without a physical factory reset.'
+          '${_session == null ? "\n\nYou are NOT signed in, so this lock "
+                    "will not be backed up. Until you sign in, this phone "
+                    "holds its only credential." : ""}',
         ),
         actions: [
           TextButton(
@@ -912,6 +1024,16 @@ class _ScanPageState extends State<ScanPage> {
           PopupMenuButton<void>(
             enabled: !_isBusy,
             itemBuilder: (context) => [
+              if (_session case final session?)
+                PopupMenuItem<void>(
+                  onTap: _signOut,
+                  child: Text('Sign out (${session.username})'),
+                )
+              else
+                PopupMenuItem<void>(
+                  onTap: () => _openLogin(),
+                  child: const Text('Sign in'),
+                ),
               PopupMenuItem<void>(
                 onTap: () => _syncNow(showReport: true),
                 child: const Text('Sync now'),
@@ -935,6 +1057,7 @@ class _ScanPageState extends State<ScanPage> {
       body: Column(
         children: [
           if (_isBusy) const LinearProgressIndicator(),
+          if (_session == null) _buildSignedOutBanner(),
           if (_message != null) _buildMessage(),
           Expanded(child: _buildBody(rows)),
         ],
@@ -944,6 +1067,33 @@ class _ScanPageState extends State<ScanPage> {
         onPressed: _isBusy ? null : _onScanPressed,
         icon: Icon(_isScanning ? Icons.stop : Icons.bluetooth_searching),
         label: Text(_isScanning ? 'Stop' : 'Scan'),
+      ),
+    );
+  }
+
+  /// Always visible while signed out, so "nothing is being backed up" can't
+  /// go unnoticed after backing out of the login screen.
+  Widget _buildSignedOutBanner() {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.secondaryContainer,
+      padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+      child: Row(
+        children: [
+          const Icon(Icons.cloud_off_outlined),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Text(
+              'Not signed in. Locks here still unlock, but nothing is '
+              'backed up.',
+            ),
+          ),
+          TextButton(
+            onPressed: () => _openLogin(),
+            child: const Text('Sign in'),
+          ),
+        ],
       ),
     );
   }
