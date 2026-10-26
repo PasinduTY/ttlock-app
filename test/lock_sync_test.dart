@@ -27,6 +27,10 @@ class _FakeServer {
   /// Called whenever the lock list is requested, before answering.
   Future<void> Function()? onList;
 
+  /// When set, like the real backend: any request without exactly this
+  /// bearer token gets 401.
+  String? requiredToken;
+
   void put(String mac, String lockData, {String name = 'Door'}) =>
       locks[mac] = {
         'mac': mac,
@@ -41,6 +45,10 @@ class _FakeServer {
     baseUrl: 'http://test',
     client: MockClient((request) async {
       if (down) throw http.ClientException('connection refused');
+      if (requiredToken case final expected?
+          when request.headers['Authorization'] != 'Bearer $expected') {
+        return http.Response('', 401);
+      }
 
       final segments = request.url.pathSegments; // already percent-decoded
       final mac = segments.length > 1 ? segments[1] : null;
@@ -201,4 +209,37 @@ void main() {
       expect(server.locks[_otherMac]!['lockData'], 'JUST-INITIALISED');
     },
   );
+
+  test('a rejected login stops the sync and loses nothing', () async {
+    // The token expired, or the account was removed.
+    server.requiredToken = 'valid-token';
+    final client = server.client()..token = 'expired-token';
+    sync = LockSync(storage: storage, backend: client);
+    server.put(_otherMac, 'ON-SERVER');
+    await storage.save(_local('NOT-YET-UPLOADED'));
+    await storage.addTombstone('CC:CC:CC:CC:CC:CC');
+
+    final report = await sync.run();
+
+    expect(report.needsLogin, isTrue);
+    expect(report.completed, isFalse);
+    // Everything on the phone is exactly as it was, ready for after login.
+    final mine = (await storage.load(_mac))!;
+    expect(mine.lockData, 'NOT-YET-UPLOADED');
+    expect(mine.backedUp, isFalse);
+    expect(await storage.loadTombstones(), {'CC:CC:CC:CC:CC:CC'});
+    expect(await storage.load(_otherMac), isNull, reason: 'nothing pulled');
+  });
+
+  test('with a valid token, the same sync goes through', () async {
+    server.requiredToken = 'valid-token';
+    final client = server.client()..token = 'valid-token';
+    sync = LockSync(storage: storage, backend: client);
+    await storage.save(_local('MINE'));
+
+    final report = await sync.run();
+
+    expect(report.completed, isTrue);
+    expect(server.locks[_mac]!['lockData'], 'MINE');
+  });
 }

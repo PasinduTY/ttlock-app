@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:ttlock_app/backend_client.dart';
+import 'package:ttlock_app/session_store.dart';
 
 const _mac = 'AA:BB:CC:DD:EE:01';
 
@@ -113,5 +114,72 @@ void main() {
     );
     expect(await _upload(client), isA<BackendUnreachable<void>>());
     expect(await client.deleteLock(_mac), isA<BackendUnreachable<void>>());
+  });
+
+  test(
+    'login: success returns the session, without setting the token',
+    () async {
+      final (:client, :sent) = _fake([
+        http.Response(
+          jsonEncode({
+            'token': 'abc.def.ghi',
+            'expiresAt': '2026-11-25T08:00:00Z',
+            'username': 'pasindu',
+          }),
+          200,
+        ),
+      ]);
+
+      final result = await client.login('Pasindu', 'secret-password');
+
+      final session = (result as BackendOk<Session>).value;
+      expect(session.token, 'abc.def.ghi');
+      expect(session.username, 'pasindu');
+      expect(session.expiresAt, DateTime.utc(2026, 11, 25, 8));
+      expect(client.token, isNull, reason: 'the caller saves, then sets it');
+      expect(sent.single.url.path, '/auth/login');
+      expect(jsonDecode(sent.single.body), {
+        'username': 'Pasindu',
+        'password': 'secret-password',
+      });
+    },
+  );
+
+  test('login: 401 means wrong username or password', () async {
+    final (:client, sent: _) = _fake([http.Response('', 401)]);
+
+    expect(
+      await client.login('pasindu', 'wrong'),
+      isA<BackendUnauthorized<Session>>(),
+    );
+  });
+
+  test('lock requests carry the token, and only when there is one', () async {
+    final (:client, :sent) = _fake([
+      http.Response('[]', 200),
+      http.Response('[]', 200),
+    ]);
+
+    await client.listLocks();
+    client.token = 'abc.def.ghi';
+    await client.listLocks();
+
+    expect(sent[0].headers.containsKey('Authorization'), isFalse);
+    expect(sent[1].headers['Authorization'], 'Bearer abc.def.ghi');
+  });
+
+  test('a 401 from /locks means log in again, for every call', () async {
+    final (:client, sent: _) = _fake([
+      http.Response('', 401),
+      http.Response('', 401),
+      http.Response('', 401),
+    ]);
+
+    expect(
+      await client.listLocks(),
+      isA<BackendUnauthorized<List<RemoteLock>>>(),
+    );
+    expect(await _upload(client), isA<BackendUnauthorized<void>>());
+    expect(await client.deleteLock(_mac), isA<BackendUnauthorized<void>>());
   });
 }

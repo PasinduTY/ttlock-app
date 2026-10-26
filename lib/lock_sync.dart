@@ -10,6 +10,7 @@ class SyncReport {
     this.deleted = 0,
     this.problems = const [],
     this.unreachableReason,
+    this.needsLogin = false,
   });
 
   /// Locks this phone had that the backend didn't, now backed up.
@@ -30,7 +31,14 @@ class SyncReport {
   /// Set when the backend stopped answering; the sync stopped there.
   final String? unreachableReason;
 
+  /// The backend rejected the login (missing, expired, or removed account).
+  /// The sync stopped there; the app should ask the user to log in again.
+  final bool needsLogin;
+
   bool get reachedBackend => unreachableReason == null;
+
+  /// Everything the sync set out to do, it did.
+  bool get completed => reachedBackend && !needsLogin;
 }
 
 /// Keeps this phone's locks and the backend's in agreement.
@@ -82,7 +90,7 @@ class LockSync {
       do {
         _runAgain = false;
         report = await _runOnce();
-      } while (_runAgain && report.reachedBackend);
+      } while (_runAgain && report.completed);
       return report;
     } finally {
       _current = null;
@@ -102,6 +110,17 @@ class LockSync {
       unreachableReason: reason,
     );
 
+    // Every later request would be refused too, so stop. Nothing is lost:
+    // tombstones and not-backed-up locks stay exactly as they are.
+    SyncReport loggedOut() => SyncReport(
+      uploaded: uploaded,
+      pulled: pulled,
+      refreshed: refreshed,
+      deleted: deleted,
+      problems: problems,
+      needsLogin: true,
+    );
+
     // 1. Pending deletes.
     for (final mac in await _storage.loadTombstones()) {
       switch (await _backend.deleteLock(mac)) {
@@ -112,6 +131,8 @@ class LockSync {
           return stopped(reason);
         case BackendError(:final reason):
           problems.add('$mac: $reason');
+        case BackendUnauthorized():
+          return loggedOut();
       }
     }
 
@@ -133,6 +154,8 @@ class LockSync {
           return stopped(reason);
         case BackendError(:final reason):
           problems.add('${lock.lockName}: $reason');
+        case BackendUnauthorized():
+          return loggedOut();
       }
     }
 
@@ -146,6 +169,8 @@ class LockSync {
       case BackendError(:final reason):
         problems.add(reason);
         remoteLocks = const [];
+      case BackendUnauthorized():
+        return loggedOut();
     }
 
     // MACs compared upper-cased: the backend always stores them that way,

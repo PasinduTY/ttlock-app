@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'session_store.dart';
+
 /// Where the backend lives.
 ///
 /// The default reaches the PC over USB via `adb reverse tcp:5007 tcp:5007`.
@@ -94,6 +96,13 @@ class BackendError<T> extends BackendResult<T> {
   final String reason;
 }
 
+/// HTTP 401. Outside of login, it means the token is missing, expired, or
+/// belongs to an account that was removed: the user has to log in again.
+/// From [BackendClient.login], it means a wrong username or password.
+class BackendUnauthorized<T> extends BackendResult<T> {
+  const BackendUnauthorized();
+}
+
 /// Every call to our backend goes through here, the way every SDK call goes
 /// through `lock_service.dart`. Widgets never build URLs or parse JSON.
 class BackendClient {
@@ -106,11 +115,56 @@ class BackendClient {
   final http.Client _client;
   final String _baseUrl;
 
+  /// The current login token, sent with every request while set. The app
+  /// sets it after logging in or loading a saved session, and clears it on
+  /// logout or when the backend answers 401.
+  String? token;
+
   /// Without this, a request to a machine that never answers can hang for
   /// well over a minute before failing.
   static const Duration _timeout = Duration(seconds: 5);
 
   String get baseUrl => _baseUrl;
+
+  /// Logs in. A [BackendUnauthorized] result means a wrong username or
+  /// password; the backend deliberately doesn't say which.
+  ///
+  /// Does not set [token]: the caller saves the session first, then sets it,
+  /// so a crash between the two can't leave a login that isn't remembered.
+  Future<BackendResult<Session>> login(String username, String password) async {
+    final http.Response response;
+    final request = _send(
+      () => _client.post(
+        Uri.parse('$_baseUrl/auth/login'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({'username': username, 'password': password}),
+      ),
+    );
+    switch (await request) {
+      case BackendOk(:final value):
+        response = value;
+      case BackendUnreachable(:final reason):
+        return BackendUnreachable(reason);
+      case BackendError(:final reason):
+        return BackendError(reason);
+      case BackendUnauthorized():
+        return const BackendUnauthorized();
+    }
+
+    if (response.statusCode != 200) {
+      return BackendError('Login failed: HTTP ${response.statusCode}.');
+    }
+
+    try {
+      return BackendOk(
+        Session.fromJson(jsonDecode(response.body) as Map<String, dynamic>),
+      );
+    } catch (_) {
+      return const BackendError(
+        'The login reply was not in the expected format.',
+      );
+    }
+  }
 
   Future<HealthResult> checkHealth() async {
     final http.Response response;
@@ -140,13 +194,15 @@ class BackendClient {
   /// Every lock the backend holds.
   Future<BackendResult<List<RemoteLock>>> listLocks() async {
     final http.Response response;
-    switch (await _send(() => _client.get(_locksUri()))) {
+    switch (await _send(() => _client.get(_locksUri(), headers: _headers()))) {
       case BackendOk(:final value):
         response = value;
       case BackendUnreachable(:final reason):
         return BackendUnreachable(reason);
       case BackendError(:final reason):
         return BackendError(reason);
+      case BackendUnauthorized():
+        return const BackendUnauthorized();
     }
 
     if (response.statusCode != 200) {
@@ -181,7 +237,7 @@ class BackendClient {
     final create = _send(
       () => _client.post(
         _locksUri(),
-        headers: _jsonHeaders,
+        headers: _headers(json: true),
         body: jsonEncode({
           'mac': mac,
           'name': name,
@@ -197,6 +253,8 @@ class BackendClient {
         return BackendUnreachable(reason);
       case BackendError(:final reason):
         return BackendError(reason);
+      case BackendUnauthorized():
+        return const BackendUnauthorized();
     }
 
     if (createResponse.statusCode == 201) return const BackendOk(null);
@@ -210,7 +268,7 @@ class BackendClient {
     final replace = _send(
       () => _client.put(
         _locksUri(mac),
-        headers: _jsonHeaders,
+        headers: _headers(json: true),
         body: jsonEncode({
           'name': name,
           'lockData': lockData,
@@ -225,6 +283,8 @@ class BackendClient {
         return BackendUnreachable(reason);
       case BackendError(:final reason):
         return BackendError(reason);
+      case BackendUnauthorized():
+        return const BackendUnauthorized();
     }
 
     return replaceResponse.statusCode == 200
@@ -240,13 +300,17 @@ class BackendClient {
   /// it doesn't. That makes retrying a delete safe, which tombstones rely on.
   Future<BackendResult<void>> deleteLock(String mac) async {
     final http.Response response;
-    switch (await _send(() => _client.delete(_locksUri(mac)))) {
+    switch (await _send(
+      () => _client.delete(_locksUri(mac), headers: _headers()),
+    )) {
       case BackendOk(:final value):
         response = value;
       case BackendUnreachable(:final reason):
         return BackendUnreachable(reason);
       case BackendError(:final reason):
         return BackendError(reason);
+      case BackendUnauthorized():
+        return const BackendUnauthorized();
     }
 
     return response.statusCode == 204 || response.statusCode == 404
@@ -256,8 +320,11 @@ class BackendClient {
           );
   }
 
-  static const Map<String, String> _jsonHeaders = {
-    'Content-Type': 'application/json',
+  /// Headers for a `/locks` request. The one place the token is attached,
+  /// so no request can forget it.
+  Map<String, String> _headers({bool json = false}) => {
+    if (json) 'Content-Type': 'application/json',
+    if (token case final token?) 'Authorization': 'Bearer $token',
   };
 
   /// `/locks`, or `/locks/<mac>`. The MAC is percent-encoded so its colons
@@ -268,13 +335,16 @@ class BackendClient {
         : '$_baseUrl/locks/${Uri.encodeComponent(mac)}',
   );
 
-  /// Runs one request, turning "no answer" into [BackendUnreachable] so each
-  /// caller only has to think about what the server said.
+  /// Runs one request, turning "no answer" into [BackendUnreachable] and a
+  /// 401 into [BackendUnauthorized], so each caller only has to think about
+  /// the answers specific to it.
   Future<BackendResult<http.Response>> _send(
     Future<http.Response> Function() request,
   ) async {
     try {
-      return BackendOk(await request().timeout(_timeout));
+      final response = await request().timeout(_timeout);
+      if (response.statusCode == 401) return const BackendUnauthorized();
+      return BackendOk(response);
     } on TimeoutException {
       return BackendUnreachable('No answer within ${_timeout.inSeconds} s.');
     } on http.ClientException catch (error) {

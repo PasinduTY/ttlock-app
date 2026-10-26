@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'secure_storage.dart';
+
 /// A lock this phone has initialised, with everything needed to talk to it
 /// again after a restart.
 class SavedLock {
@@ -83,14 +85,7 @@ class SavedLock {
 /// is no read-modify-write step to get wrong.
 class LockStorage {
   LockStorage({FlutterSecureStorage? storage})
-    : _storage =
-          storage ??
-          const FlutterSecureStorage(
-            // Off by default in 9.x. Without it the plugin falls back to an
-            // older scheme; this opts into AES-256-GCM via androidx.security,
-            // with the key held in the Android Keystore.
-            aOptions: AndroidOptions(encryptedSharedPreferences: true),
-          );
+    : _storage = storage ?? appSecureStorage;
 
   final FlutterSecureStorage _storage;
 
